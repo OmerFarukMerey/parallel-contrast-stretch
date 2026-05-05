@@ -2,8 +2,12 @@
 #define STB_IMAGE_IMPLEMENTATION
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 
+// stb_image.h has a few harmless "set but never used" warnings; silence them
+// only around the third-party include so our own code keeps full diagnostics.
+#pragma nv_diag_suppress 550
 #include "stb_image.h"
 #include "stb_image_write.h"
+#pragma nv_diag_default 550
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
