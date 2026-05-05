@@ -310,13 +310,16 @@ int main() {
             // Correctness check, GPU output must match CPU output byte-for-byte.
             match[v] = (memcmp(buf_cpu, buf_gpu, img_bytes) == 0);
 
-            // Save one CPU + one GPU output per image into output_cpu/ and output_gpu/.
+            // Save one CPU + one GPU output per image into output_cpu/ and output_gpu/,
+            // reusing the source filename so inputs and outputs line up by name.
             if (variants[v] == MINMAX_REDUCE) {
                 mkdir("./output_cpu", 0755);
                 mkdir("./output_gpu", 0755);
-                char path_gpu[64], path_cpu[64];
-                snprintf(path_gpu, sizeof(path_gpu), "./output_gpu/%dx%d.bmp", width, height);
-                snprintf(path_cpu, sizeof(path_cpu), "./output_cpu/%dx%d.bmp", width, height);
+                const char* slash = strrchr(samples[s], '/');
+                const char* base = slash ? slash + 1 : samples[s];
+                char path_gpu[128], path_cpu[128];
+                snprintf(path_gpu, sizeof(path_gpu), "./output_gpu/%s", base);
+                snprintf(path_cpu, sizeof(path_cpu), "./output_cpu/%s", base);
                 stbi_write_bmp(path_gpu, width, height, 1, buf_gpu);
                 stbi_write_bmp(path_cpu, width, height, 1, buf_cpu);
             }
