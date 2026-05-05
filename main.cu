@@ -7,6 +7,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <chrono>
 #include <cuda_runtime.h>
 
@@ -403,14 +404,17 @@ int main() {
             // float -> uint8_t truncation.
             match[v] = (memcmp(buf_cpu, buf_gpu, img_bytes) == 0);
 
-            // Save outputs from the largest image for the report:
-            //   out_img_cpu.bmp     - CPU baseline result
-            //   out_img_gpu.bmp     - GPU result (using the proper reduction)
-            // You can open them side by side, or run `cmp` on them to confirm
-            // they are identical byte-for-byte.
-            if (s == n_samples - 1 && variants[v] == MINMAX_REDUCE) {
-                stbi_write_bmp("./out_img_gpu.bmp", width, height, 1, buf_gpu);
-                stbi_write_bmp("./out_img_cpu.bmp", width, height, 1, buf_cpu);
+            // Save one CPU + one GPU output per image (using the proper
+            // reduction variant for the GPU file). Files go into
+            // output_cpu/<WxH>.bmp and output_gpu/<WxH>.bmp.
+            if (variants[v] == MINMAX_REDUCE) {
+                mkdir("./output_cpu", 0755);
+                mkdir("./output_gpu", 0755);
+                char path_gpu[64], path_cpu[64];
+                snprintf(path_gpu, sizeof(path_gpu), "./output_gpu/%dx%d.bmp", width, height);
+                snprintf(path_cpu, sizeof(path_cpu), "./output_cpu/%dx%d.bmp", width, height);
+                stbi_write_bmp(path_gpu, width, height, 1, buf_gpu);
+                stbi_write_bmp(path_cpu, width, height, 1, buf_cpu);
             }
         }
         const float cpu_ms = cpu_sum_all / cpu_count_all;
@@ -436,7 +440,7 @@ int main() {
         stbi_image_free(original);
     }
 
-    printf("\nWrote ./out_img_cpu.bmp and ./out_img_gpu.bmp for visual comparison.\n");
-    printf("Verify byte-identical with:  cmp out_img_cpu.bmp out_img_gpu.bmp\n");
+    printf("\nWrote ./output_cpu/<WxH>.bmp and ./output_gpu/<WxH>.bmp for each sample.\n");
+    printf("Verify byte-identical with e.g.:  cmp output_cpu/640x426.bmp output_gpu/640x426.bmp\n");
     return 0;
 }
