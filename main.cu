@@ -1,9 +1,7 @@
-// Do not alter the preprocessor directives
 #define STB_IMAGE_IMPLEMENTATION
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 
-// stb_image.h has a few harmless "set but never used" warnings; silence them
-// only around the third-party include so our own code keeps full diagnostics.
+// Silence "set but never used" warnings from stb_image.h only.
 #pragma nv_diag_suppress 550
 #include "stb_image.h"
 #include "stb_image_write.h"
@@ -17,10 +15,7 @@
 
 #define NUM_CHANNELS 1
 
-// Tiny helper, every CUDA call returns a cudaError_t. If it isn't cudaSuccess,
-// something went wrong (out of memory, bad pointer, kernel launch failure, etc.).
-// Since I am using Google Colab, 
-// this macro prints the error and aborts so we don't keep running on a broken state or session.
+// Abort on any CUDA error.
 #define CUDA_CHECK(call)                                                       \
     do {                                                                       \
         cudaError_t err = (call);                                              \
@@ -32,8 +27,9 @@
     } while (0)
 
 
-// ---------- CPU baselines (unchanged from main.cpp, kept for reference) ----------
+// ---------- CPU baselines ----------
 
+// Single pass over the image, tracking running min and max.
 void min_max_of_img_host(uint8_t* img, uint8_t* min, uint8_t* max, int width, int height) {
     int max_tmp = 0;
     int min_tmp = 255;
@@ -45,64 +41,43 @@ void min_max_of_img_host(uint8_t* img, uint8_t* min, uint8_t* max, int width, in
     *min = min_tmp;
 }
 
+// Subtract the same value from every pixel (uint8_t wraparound is fine here -
+// callers pass sub_value <= every pixel).
 void sub_host(uint8_t* img, uint8_t sub_value, int width, int height) {
     for (int n = 0; n < width * height; n++) {
         img[n] -= sub_value;
     }
 }
 
+// Multiply every pixel by `constant`. Float result is implicitly truncated
+// back to uint8_t, GPU mirrors this exactly so outputs match byte-for-byte.
 void scale_host(uint8_t* img, float constant, int width, int height) {
     for (int n = 0; n < width * height; n++) {
-        img[n] = img[n] * constant; // implicit float -> uint8_t truncation
+        img[n] = img[n] * constant;
     }
 }
 
 
-// ---------- Step 2: KERNEL 2 — subtract nMin from every pixel ----------
-// __global__ means: this function is launched from the host (CPU) but runs on
-// the device (GPU). Every thread that the launch creates executes this body
-// independently and concurrently.
-//
-// The launch will create (grid * block) threads in total. Each thread figures
-// out which pixel it owns by computing a unique linear index from its position
-// in the grid:
-//
-//     idx = blockIdx.x * blockDim.x + threadIdx.x
-//            ^^^^^^^^^   ^^^^^^^^^^   ^^^^^^^^^^^
-//            which block | block size | which thread inside the block
-//
-// Because we round the grid size up, we may launch a few more threads than we
-// have pixels — those extra threads just exit via the bounds check.
+// ---------- GPU kernels ----------
+
+// KERNEL 2: subtract sub_value from every pixel.
 __global__ void sub_kernel(uint8_t* img, uint8_t sub_value, int n) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < n) {
-        img[idx] -= sub_value;   // same uint8_t arithmetic as sub_host
+        img[idx] -= sub_value;
     }
 }
 
-
-// ---------- Step 3: KERNEL 3 — scale every pixel by 255 / (nMax - nMin) ----------
-// Same one-thread-per-pixel pattern as sub_kernel. The only differences:
-//   1) the operation is a multiply by a float `constant`,
-//   2) the result is stored back as uint8_t, so the float result is implicitly
-//      truncated (not rounded) — exactly what scale_host does on the CPU. We
-//      keep the same behavior so the GPU output matches the CPU output bit-for-bit.
+// KERNEL 3: scale every pixel by constant (float -> uint8_t truncation).
 __global__ void scale_kernel(uint8_t* img, float constant, int n) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < n) {
-        img[idx] = img[idx] * constant;   // float -> uint8_t implicit truncation
+        img[idx] = img[idx] * constant;
     }
 }
 
-
-// ---------- Step 4a: KERNEL 1 — naive min/max with global atomics ----------
-// Every thread reads one pixel and atomically updates a single global min and
-// a single global max. This is correct but SLOW: when many threads race on the
-// same address, the hardware must serialize their updates. Useful as a
-// baseline — and as a teaching example of *why* a real reduction matters.
-//
-// Note: CUDA's atomicMin/atomicMax don't take uint8_t. We promote pixel values
-// to int, and the caller initializes g_min=255, g_max=0 before launching.
+// KERNEL 1 (naive): each thread updates a single global min/max with atomics.
+// atomicMin/atomicMax need int*, so caller passes ints initialized to 255/0.
 __global__ void minmax_atomic_kernel(const uint8_t* img, int n,
                                      int* g_min, int* g_max) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -113,39 +88,9 @@ __global__ void minmax_atomic_kernel(const uint8_t* img, int n,
     }
 }
 
-
-// ---------- Step 4b: KERNEL 1 — proper parallel reduction in shared memory ----------
-// This is the version the assignment is really asking for (see the lecture's
-// "parallel reduction" slides). Big idea:
-//
-//   1) Each block loads its tile of pixels into __shared__ memory. Shared
-//      memory lives on-chip per SM — about ~100x lower latency than global
-//      DRAM, so repeated reads/writes during the reduction are fast.
-//
-//   2) Inside the block we do a TREE REDUCTION. Start with `stride = blockDim/2`.
-//      Threads with tid < stride combine s[tid] with s[tid + stride]. Halve
-//      the stride and repeat until stride == 0. After log2(blockDim) steps,
-//      s[0] holds the block's min (and a parallel array holds the block's max).
-//
-//        block_size = 8 example, reducing min:
-//          [ 5  3  9  1  7  4  6  2 ]   stride=4 -> compare i with i+4
-//          [ 5  3  6  1  ]               stride=2
-//          [ 5  1 ]                      stride=1
-//          [ 1 ]                         done
-//
-//   3) Thread 0 of each block writes its block-min/max to the global answer
-//      via atomicMin/atomicMax. Now atomics contend at most once per block
-//      (instead of once per pixel), which is orders of magnitude less.
-//
-// __syncthreads() is essential between steps: it forces every thread in the
-// block to reach this point before any moves on. Without it, some threads
-// would read s[tid+stride] before others had written it -> race condition,
-// wrong answer.
-//
-// Shared-memory layout: we need TWO arrays (one for min, one for max). We
-// use dynamic shared memory (size set at launch time via the third <<<>>>
-// argument) so we can size it to blockDim. Pointers s_min and s_max carve
-// the single buffer into two halves.
+// KERNEL 1 (reduction): per-block tree reduction in shared memory, then one
+// atomicMin/atomicMax per block. Dynamic shared memory holds two parallel
+// arrays (s_min, s_max) of size blockDim.
 __global__ void minmax_reduce_kernel(const uint8_t* img, int n,
                                      int* g_min, int* g_max) {
     extern __shared__ int s_data[];
@@ -155,14 +100,11 @@ __global__ void minmax_reduce_kernel(const uint8_t* img, int n,
     int tid = threadIdx.x;
     int idx = blockIdx.x * blockDim.x + tid;
 
-    // Load. Out-of-range threads load IDENTITY values: 255 for min (won't
-    // win), 0 for max (won't win). This way we don't need bounds checks
-    // inside the reduction loop.
+    // Out-of-range threads load identity values so the reduction loop has no bounds checks.
     s_min[tid] = (idx < n) ? (int)img[idx] : 255;
     s_max[tid] = (idx < n) ? (int)img[idx] : 0;
     __syncthreads();
 
-    // Tree reduction in shared memory.
     for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
         if (tid < stride) {
             int other_min = s_min[tid + stride];
@@ -173,7 +115,6 @@ __global__ void minmax_reduce_kernel(const uint8_t* img, int n,
         __syncthreads();
     }
 
-    // One atomic per block, not per pixel — almost no contention.
     if (tid == 0) {
         atomicMin(g_min, s_min[0]);
         atomicMax(g_max, s_max[0]);
@@ -181,36 +122,17 @@ __global__ void minmax_reduce_kernel(const uint8_t* img, int n,
 }
 
 
-// ---------- Step 5: timing helpers + benchmark pipeline ----------
-//
-// We compare the CPU pipeline against the GPU pipeline. To make the comparison
-// fair both must start from the same input pixels. They each operate on their
-// own copy of the buffer (`out` parameter).
-//
-// CPU timing: std::chrono::high_resolution_clock — wall-clock time around the
-// three host functions called in sequence.
-//
-// GPU timing: we use cudaEvents (recorded ON the GPU stream). Two separate
-// intervals are measured:
-//   - "kernels only": from just before the first kernel to just after the last
-//     kernel. This is the work the GPU literally does.
-//   - "total"       : also includes the H2D and D2H pixel copies. This is what
-//     the user actually waits for in practice.
-//
-// Why measure both? On small images the PCIe copies can dominate the kernel
-// time and the GPU may even be slower than the CPU end-to-end. On big images
-// the kernels dominate and the GPU pulls ahead by a wide margin. Showing both
-// numbers makes that crossover visible in your report.
+// ---------- Benchmark pipelines ----------
+// CPU timing uses std::chrono. GPU timing uses cudaEvents and reports two
+// intervals: kernels-only, and total (includes H2D + D2H transfers).
 
 struct CpuResult { float ms; };
 struct GpuResult { float total_ms; float kernels_ms; uint8_t min; uint8_t max; };
 
-// Which min/max kernel to use. The other two kernels (subtract, scale) are
-// the same in both modes — only KERNEL 1 differs. We expose this so the bench
-// can directly compare the naive atomic baseline against the proper reduction.
+// Selects which KERNEL 1 implementation the GPU pipeline uses.
 enum MinMaxKind { MINMAX_ATOMIC = 0, MINMAX_REDUCE = 1 };
 
-// Run the CPU baseline pipeline on `out` (modified in place). Returns elapsed ms.
+// Run the full CPU pipeline (min/max -> subtract -> scale) on `out` in place.
 static CpuResult run_cpu_pipeline(uint8_t* out, int width, int height) {
     using clock = std::chrono::high_resolution_clock;
     uint8_t mn, mx;
@@ -227,15 +149,14 @@ static CpuResult run_cpu_pipeline(uint8_t* out, int width, int height) {
     return r;
 }
 
-// Run the GPU pipeline on `out` (modified in place). Returns elapsed times
-// plus the min/max the GPU computed so we can sanity-check against the CPU.
-// `mm` selects which KERNEL 1 implementation to use.
+// Run the full GPU pipeline on `out` in place. Returns kernels-only time
+// (GPU work) and total time (work + H2D/D2H copies), plus the min/max found.
 static GpuResult run_gpu_pipeline(uint8_t* out, int width, int height,
                                   MinMaxKind mm) {
     const int n_pixels = width * height;
     const size_t img_bytes = (size_t)n_pixels;
 
-    // Device allocations.
+    // Device buffers: one for the image, two scalars for min/max.
     uint8_t* d_image = nullptr;
     int* d_min = nullptr;
     int* d_max = nullptr;
@@ -243,32 +164,29 @@ static GpuResult run_gpu_pipeline(uint8_t* out, int width, int height,
     CUDA_CHECK(cudaMalloc(&d_min, sizeof(int)));
     CUDA_CHECK(cudaMalloc(&d_max, sizeof(int)));
 
-    // Events for timing. Unlike chrono, cudaEvents are recorded into the GPU
-    // stream itself — the GPU stamps them between the operations actually
-    // executing on the device, so they don't include CPU-side bookkeeping.
     cudaEvent_t e_total_begin, e_kernels_begin, e_kernels_end, e_total_end;
     CUDA_CHECK(cudaEventCreate(&e_total_begin));
     CUDA_CHECK(cudaEventCreate(&e_kernels_begin));
     CUDA_CHECK(cudaEventCreate(&e_kernels_end));
     CUDA_CHECK(cudaEventCreate(&e_total_end));
 
+    // Launch config: 256 threads/block, enough blocks to cover every pixel,
+    // shared memory sized for two int arrays (min + max) of `block_size`.
     const int block_size = 256;
     const int grid_size  = (n_pixels + block_size - 1) / block_size;
     const size_t shmem_bytes = 2 * block_size * sizeof(int);
 
-    // ---- begin total interval ----
     CUDA_CHECK(cudaEventRecord(e_total_begin));
 
-    // H2D: image + initialize d_min/d_max identity values.
+    // H2D: upload image and seed min/max with identity values.
     CUDA_CHECK(cudaMemcpy(d_image, out, img_bytes, cudaMemcpyHostToDevice));
     int init_min = 255, init_max = 0;
     CUDA_CHECK(cudaMemcpy(d_min, &init_min, sizeof(int), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_max, &init_max, sizeof(int), cudaMemcpyHostToDevice));
 
-    // ---- begin kernels-only interval ----
     CUDA_CHECK(cudaEventRecord(e_kernels_begin));
 
-    // Kernel 1: select naive atomic vs shared-memory reduction.
+    // KERNEL 1 - pick atomic or reduction variant.
     if (mm == MINMAX_REDUCE) {
         minmax_reduce_kernel<<<grid_size, block_size, shmem_bytes>>>(
             d_image, n_pixels, d_min, d_max);
@@ -278,10 +196,7 @@ static GpuResult run_gpu_pipeline(uint8_t* out, int width, int height,
     }
     CUDA_CHECK(cudaGetLastError());
 
-    // Pull the two scalars back so the host can compute scale_constant. This
-    // small DtoH copy belongs to the kernels-only interval because it's part
-    // of the GPU pipeline's critical path. (cudaMemcpy of <= 64KB on the
-    // default stream synchronizes — it implicitly waits for kernel 1.)
+    // Pull min/max back so the host can compute the scale factor.
     int min_int, max_int;
     CUDA_CHECK(cudaMemcpy(&min_int, d_min, sizeof(int), cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(&max_int, d_max, sizeof(int), cudaMemcpyDeviceToHost));
@@ -289,22 +204,18 @@ static GpuResult run_gpu_pipeline(uint8_t* out, int width, int height,
     uint8_t mx = (uint8_t)max_int;
     float scale_constant = 255.0f / (mx - mn);
 
-    // Kernels 2 and 3.
+    // KERNEL 2 then KERNEL 3.
     sub_kernel<<<grid_size, block_size>>>(d_image, mn, n_pixels);
     CUDA_CHECK(cudaGetLastError());
     scale_kernel<<<grid_size, block_size>>>(d_image, scale_constant, n_pixels);
     CUDA_CHECK(cudaGetLastError());
 
     CUDA_CHECK(cudaEventRecord(e_kernels_end));
-    // ---- end kernels-only interval ----
 
-    // D2H: pull modified pixels back so the host can write the BMP.
+    // D2H: bring the processed pixels back to the host buffer.
     CUDA_CHECK(cudaMemcpy(out, d_image, img_bytes, cudaMemcpyDeviceToHost));
 
     CUDA_CHECK(cudaEventRecord(e_total_end));
-    // ---- end total interval ----
-
-    // Wait for the very last event before reading elapsed times.
     CUDA_CHECK(cudaEventSynchronize(e_total_end));
 
     GpuResult r;
@@ -325,7 +236,7 @@ static GpuResult run_gpu_pipeline(uint8_t* out, int width, int height,
 
 
 int main() {
-    // The four sample images supplied with the assignment.
+    // Test images at increasing resolutions.
     const char* samples[] = {
         "./samples/640x426.bmp",
         "./samples/1280x843.bmp",
@@ -334,17 +245,11 @@ int main() {
     };
     const int n_samples = sizeof(samples) / sizeof(samples[0]);
 
-    // Number of timed iterations to AVERAGE per image. Wall-clock noise on a
-    // single run is large (Colab VMs are shared); averaging stabilizes things.
-    // We also do ONE warm-up iteration that we throw away — the very first
-    // CUDA call in a process pays JIT + context-init costs that aren't
-    // representative of steady-state performance.
+    // One warmup (drops JIT/context-init cost) plus N timed iterations averaged.
     const int n_warmup = 1;
     const int n_iters  = 5;
 
-    // Two table rows per image: one using the atomic kernel (4a), one using
-    // the shared-memory reduction kernel (4b). The subtract and scale kernels
-    // are identical in both rows — the only thing that varies is KERNEL 1.
+    // Table header.
     printf("\n%-22s | %-8s | %10s | %12s | %12s | %10s | %10s | %s\n",
            "image", "minmax", "CPU ms", "GPU total ms", "GPU kern ms",
            "spd total", "spd kern", "match?");
@@ -359,15 +264,15 @@ int main() {
         }
         const size_t img_bytes = (size_t)width * height;
 
+        // Two scratch buffers so CPU and GPU don't clobber each other's input.
         uint8_t* buf_cpu = (uint8_t*)malloc(img_bytes);
         uint8_t* buf_gpu = (uint8_t*)malloc(img_bytes);
 
-        // Run BOTH min/max variants. Each gets its own warmup + timed runs.
+        // Run both KERNEL 1 variants for comparison.
         const MinMaxKind variants[2]  = { MINMAX_ATOMIC, MINMAX_REDUCE };
         const char*      var_label[2] = { "atomic",      "reduce"      };
 
-        // We average CPU time across all iterations of all variants — the CPU
-        // pipeline doesn't depend on the GPU choice.
+        // CPU time is independent of the variant, so pool every iteration.
         float cpu_sum_all = 0.0f;
         int cpu_count_all = 0;
 
@@ -378,7 +283,7 @@ int main() {
         uint8_t mn_v[2] = {0,0}, mx_v[2] = {0,0};
 
         for (int v = 0; v < 2; v++) {
-            // Warm-up.
+            // Warmup runs are discarded (first CUDA call pays JIT/init cost).
             for (int i = 0; i < n_warmup; i++) {
                 memcpy(buf_cpu, original, img_bytes);
                 run_cpu_pipeline(buf_cpu, width, height);
@@ -402,15 +307,10 @@ int main() {
             gpu_total[v] /= n_iters;
             gpu_kern[v]  /= n_iters;
 
-            // Step 6 byte-identical correctness check: CPU result vs GPU result
-            // for this variant. Both should be exactly the same bytes because
-            // both pipelines use identical integer arithmetic and identical
-            // float -> uint8_t truncation.
+            // Correctness check, GPU output must match CPU output byte-for-byte.
             match[v] = (memcmp(buf_cpu, buf_gpu, img_bytes) == 0);
 
-            // Save one CPU + one GPU output per image (using the proper
-            // reduction variant for the GPU file). Files go into
-            // output_cpu/<WxH>.bmp and output_gpu/<WxH>.bmp.
+            // Save one CPU + one GPU output per image into output_cpu/ and output_gpu/.
             if (variants[v] == MINMAX_REDUCE) {
                 mkdir("./output_cpu", 0755);
                 mkdir("./output_gpu", 0755);
@@ -423,6 +323,7 @@ int main() {
         }
         const float cpu_ms = cpu_sum_all / cpu_count_all;
 
+        // Print one row per variant, then the min/max found for this image.
         for (int v = 0; v < 2; v++) {
             char tag[32];
             snprintf(tag, sizeof(tag), "%dx%d", width, height);
@@ -434,8 +335,6 @@ int main() {
                    cpu_ms / gpu_total[v], cpu_ms / gpu_kern[v],
                    match[v] ? "ok" : "MISMATCH");
         }
-        // Show the min/max values found (identical between CPU/GPU and between
-        // variants — printing once per image is enough). Useful for the report.
         printf("%-22s | min=%u max=%u (used by all variants)\n",
                "", (unsigned)mn_v[1], (unsigned)mx_v[1]);
 
