@@ -1,50 +1,45 @@
-# Prerequisites
-*.d
+# --- Project artifacts ---
+contrast_stretch
+out_img.bmp
+output_cpu/
+output_gpu/
 
-# Compiled Object files
-*.slo
-*.lo
+# --- C/C++ build output ---
 *.o
 *.obj
-
-# Precompiled Headers
+*.d
+*.slo
+*.lo
 *.gch
 *.pch
-
-# Linker files
 *.ilk
-
-# Debugger Files
 *.pdb
-
-# Compiled Dynamic libraries
 *.so
+*.so.*
 *.dylib
 *.dll
-*.so.*
-
-
-# Fortran module files
-*.mod
-*.smod
-
-# Compiled Static libraries
-*.lai
-*.la
 *.a
+*.la
+*.lai
 *.lib
-
-# Executables
 *.exe
 *.out
 *.app
+*.dwo
 
-# Build directories
+# --- CUDA ---
+*.cubin
+*.fatbin
+*.ptx
+*.i
+*.ii
+
+# --- Build directories ---
 build/
 Build/
 build-*/
 
-# CMake generated files
+# --- CMake ---
 CMakeFiles/
 CMakeCache.txt
 cmake_install.cmake
@@ -52,21 +47,26 @@ Makefile
 install_manifest.txt
 compile_commands.json
 
-# Temporary files
+# --- macOS ---
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# --- Editor / IDE ---
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# --- Temporary files ---
 *.tmp
 *.log
 *.bak
-*.swp
 
-# vcpkg
-vcpkg_installed/
-
-# debug information files
-*.dwo
-
-# test output & cache
-Testing/
-.cache/
-
-# Documentation
+# --- Generated docs (PDF is built from REPORT.md) ---
 *.pdf
+*.docx
+
+# --- Other ---
+*.zip
